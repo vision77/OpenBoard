@@ -1,3 +1,4 @@
+import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -70,11 +71,44 @@ const recordEvent = (boardId: string, actorId: string, type: string, payload: ob
     .prepare("INSERT INTO board_events VALUES (?, ?, ?, ?, ?, ?)")
     .run(id(), boardId, actorId, type, JSON.stringify(payload), now());
 };
-const hash = async (value: string): Promise<string> =>
+// Passwords are stored as scrypt$<salt>$<derived>. Plain SHA-256 was used
+// before: unsalted, so identical passwords collided and rainbow tables applied,
+// and fast enough that guessing was cheap. scrypt is deliberately slow and
+// memory-hard, which is the property that matters here.
+const SCRYPT_KEYLEN = 64;
+const derive = (value: string, salt: Buffer): Promise<Buffer> =>
+  new Promise((resolve, reject) => {
+    scrypt(value, salt, SCRYPT_KEYLEN, (error, key) => (error ? reject(error) : resolve(key)));
+  });
+const hash = async (value: string): Promise<string> => {
+  const salt = randomBytes(16);
+  const key = await derive(value, salt);
+  return `scrypt$${salt.toString("hex")}$${key.toString("hex")}`;
+};
+// Legacy SHA-256 digests are still accepted so existing accounts keep working;
+// verifyPassword reports when one was used so the caller can re-hash it.
+const legacyDigest = async (value: string): Promise<string> =>
   Array.from(
     new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))),
     (byte) => byte.toString(16).padStart(2, "0"),
   ).join("");
+const verifyPassword = async (
+  value: string,
+  stored: string,
+): Promise<{ readonly ok: boolean; readonly legacy: boolean }> => {
+  const parts = stored.split("$");
+  if (parts[0] === "scrypt" && parts.length === 3) {
+    const salt = Buffer.from(parts[1] as string, "hex");
+    const expected = Buffer.from(parts[2] as string, "hex");
+    const actual = await derive(value, salt);
+    const ok = expected.length === actual.length && timingSafeEqual(expected, actual);
+    return { ok, legacy: false };
+  }
+  const digest = Buffer.from(await legacyDigest(value), "hex");
+  const expected = Buffer.from(stored, "hex");
+  const ok = expected.length === digest.length && timingSafeEqual(expected, digest);
+  return { ok, legacy: true };
+};
 const userForSession = (session: string | undefined): User | null => {
   if (!session) return null;
   return database
@@ -119,8 +153,13 @@ app.post("/api/auth/login", zValidator("json", userInput), async (context) => {
     .get(input.name) as
     | { readonly id: string; readonly name: string; readonly password: string }
     | undefined;
-  if (!account || account.password !== (await hash(input.password)))
-    return context.json({ error: "Invalid credentials." }, 401);
+  if (!account) return context.json({ error: "Invalid credentials." }, 401);
+  const verified = await verifyPassword(input.password, account.password);
+  if (!verified.ok) return context.json({ error: "Invalid credentials." }, 401);
+  if (verified.legacy)
+    database
+      .prepare("UPDATE users SET password = ? WHERE id = ?")
+      .run(await hash(input.password), account.id);
   const session = id();
   database.prepare("INSERT INTO sessions VALUES (?, ?, ?)").run(session, account.id, now());
   setCookie(context, "openboard_session", session, { httpOnly: true, sameSite: "Lax", path: "/" });
