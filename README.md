@@ -29,3 +29,9 @@ npm run build
 - `data/blobs/` stores uploaded board assets on the local filesystem.
 - The server exposes a local HTTP API and per-board WebSocket rooms.
 - No cloud provider, remote database, hosted identity service, or external analytics is required.
+
+## License
+
+AGPL-3.0. You can use, modify, and redistribute Openboard freely. If you run a
+modified version as a network service, you have to publish those modifications
+too — that clause is the reason this license was picked over MIT or GPL.
